@@ -1,0 +1,619 @@
+// main contract: escrow.sol
+// SPDX-License-Identifier: MIT
+pragma solidity =0.8.20;
+
+import "@openzeppelin/contracts/utils/Address.sol";
+
+contract MeetupContract {
+    address payable public participant1;  
+    address payable public participant2;  
+    uint256 public meetingTime;
+    uint256 public depositAmount;
+    bool public arrived1;
+    bool public arrived2;
+
+    // NEW: Track single deposits per participant (prevent multiple deposits)
+    bool public deposited1;
+    bool public deposited2;
+
+    // NEW: auto-finalize once BOTH arrived; and allow timeout-based settle
+    bool public finalized;
+    uint256 public constant CONFIRM_WINDOW = 60 minutes; // <- Timeout nach MeetingTime
+
+    uint256 public penaltyRatePerMinute; // e.g., 200 = 2% per minute
+    uint256 public cancellationTimeout = 5 minutes;
+    bool public cancelRequest1;
+    bool public cancelRequest2;
+
+    // Events
+    event Deposited(address indexed participant, uint256 amount);
+    event Arrived(address indexed participant, uint256 arrivalTime);
+    event Cancelled(address indexed initiator);
+    event Finalized(address indexed participant1, address indexed participant2, bool success);
+
+    // NEW: Emitted when auto-finalization happens (either 2/2 confirms or timeout settle)
+    event AutoFinalized(uint256 when);
+
+    constructor(
+        address payable _participant1,
+        address payable _participant2, 
+        uint256 _meetingTime,
+        uint256 _depositAmount,
+        uint256 _penaltyRatePerMinute
+    ) {
+        require(_meetingTime > block.timestamp, "Meeting time must be in the future");
+        require(_participant1 != _participant2, "Participants must be different");
+        require(_depositAmount > 0, "Deposit must be > 0");
+
+        participant1 = _participant1;  
+        participant2 = _participant2; 
+        meetingTime = _meetingTime;
+        depositAmount = _depositAmount;
+        penaltyRatePerMinute = _penaltyRatePerMinute;
+    }
+
+    function deposit() external payable {
+        require(msg.sender == participant1 || msg.sender == participant2, "Not a participant");
+        require(msg.value == depositAmount, "Incorrect deposit amount");
+        require(!finalized, "Already finalized");
+
+        // NEW: prevent multiple deposits from same participant
+        if (msg.sender == participant1) {
+            require(!deposited1, "Already deposited");
+            deposited1 = true;
+        } else {
+            require(!deposited2, "Already deposited");
+            deposited2 = true;
+        }
+
+        emit Deposited(msg.sender, msg.value);
+    }
+
+    // Arrival confirmation (each participant can confirm once)
+    function confirmArrival() external {
+        require(msg.sender == participant1 || msg.sender == participant2, "Not a participant");
+        require(block.timestamp >= meetingTime, "Meeting time not reached");
+        require(!finalized, "Already finalized");
+
+        if (msg.sender == participant1) {
+            require(!arrived1, "Already confirmed");
+            arrived1 = true;
+        } else {
+            require(!arrived2, "Already confirmed");
+            arrived2 = true;
+        }
+        emit Arrived(msg.sender, block.timestamp);
+
+        // NEW: Auto-finalize as soon as BOTH have confirmed
+        if (arrived1 && arrived2) {
+            finalized = true;
+            _finalize();
+            emit AutoFinalized(block.timestamp);
+        }
+    }
+
+    // Cancellation function (both must agree, within 5 minutes)
+    //@dev not yet working
+    function cancel() external {
+        require(!finalized, "Already finalized");
+        require(block.timestamp < meetingTime + cancellationTimeout, "Cancellation window expired");
+        require(msg.sender == participant1 || msg.sender == participant2, "Not a participant");
+
+        if (msg.sender == participant1) cancelRequest1 = true;
+        else cancelRequest2 = true;
+
+        require(cancelRequest1 && cancelRequest2, "Both participants must agree");
+
+        finalized = true;
+        _refundBoth();
+        emit Cancelled(msg.sender);
+    }
+
+    // DEPRECATION NOTE:
+    // Alte "Mutual confirmation"-Funktion. Wir lassen sie kompatibel,
+    // aber sie nutzt jetzt dieselbe Logik: finalisiere NUR wenn beide angekommen sind.
+    function confirmOtherArrival() external {
+        require(!finalized, "Already finalized");
+        require(msg.sender == participant1 || msg.sender == participant2, "Not a participant");
+        // Erlaube nur, wenn beide bereits bestätigt haben (kein einseitiges Lösen)
+        require(arrived1 && arrived2, "Both must confirm");
+
+        finalized = true;
+        _finalize();
+        emit AutoFinalized(block.timestamp);
+    }
+
+    // NEW: Timeout-basiertes Settlement
+    // Jeder darf nach meetingTime + CONFIRM_WINDOW finalisieren,
+    // falls nicht bereits durch 2/2-Confirm auto-finalized.
+    function settle() external {
+        require(!finalized, "Already finalized");
+        require(
+            (arrived1 && arrived2) || block.timestamp >= meetingTime + CONFIRM_WINDOW,
+            "Waiting for both confirmations or timeout"
+        );
+        finalized = true;
+        _finalize();
+        emit AutoFinalized(block.timestamp);
+    }
+
+    // Finalization logic (unchanged core payout logic)
+    function _finalize() private {
+        bool bothArrived = arrived1 && arrived2;
+
+        if (bothArrived) {
+            uint256 penalty1 = _calculatePenalty();
+            uint256 penalty2 = _calculatePenalty();
+
+            if (penalty1 == 0 && penalty2 == 0) {
+                _refundBoth();
+            } else if (penalty1 > penalty2) {
+                _transferWithRevert(participant2, penalty1);
+                _transferWithRevert(participant1, depositAmount - penalty1);
+            } else if (penalty2 > penalty1) {
+                _transferWithRevert(participant1, penalty2);
+                _transferWithRevert(participant2, depositAmount - penalty2);
+            } else {
+                // Both equally late → no penalty
+                _refundBoth();
+            }
+
+            emit Finalized(participant1, participant2, true);
+        } else {
+            // Only one participant arrived
+            address payable lateParticipant = !arrived1 ? participant1 : participant2;
+            address payable onTimeParticipant = arrived1 ? participant1 : participant2;
+            uint256 penalty = _calculatePenalty();
+            _transferWithRevert(onTimeParticipant, penalty);
+            _transferWithRevert(lateParticipant, depositAmount - penalty);
+            emit Finalized(participant1, participant2, false);
+        }
+    }
+
+    function _refundBoth() private {
+        _transferWithRevert(participant1, depositAmount);
+        _transferWithRevert(participant2, depositAmount);
+    }    
+
+    function _calculatePenalty() private view returns (uint256) {
+        if (block.timestamp <= meetingTime) return 0;
+        uint256 minutesLate = (block.timestamp - meetingTime) / 60;
+        uint256 penalty = (depositAmount * minutesLate * penaltyRatePerMinute) / 10000;
+        if (penalty > depositAmount) penalty = depositAmount;
+        return penalty;
+    }
+
+    function _transferWithRevert(address payable to, uint256 amount) private {
+        if (amount == 0) return;
+        (bool success, ) = to.call{value: amount}("");
+        require(success, "Transfer failed");
+    }
+
+    receive() external payable {}
+}
+
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.4.0) (utils/Address.sol)
+
+pragma solidity ^0.8.20;
+
+import {Errors} from "./Errors.sol";
+
+/**
+ * @dev Collection of functions related to the address type
+ */
+library Address {
+    /**
+     * @dev There's no code at `target` (it is not a contract).
+     */
+    error AddressEmptyCode(address target);
+
+    /**
+     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to
+     * `recipient`, forwarding all available gas and reverting on errors.
+     *
+     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost
+     * of certain opcodes, possibly making contracts go over the 2300 gas limit
+     * imposed by `transfer`, making them unable to receive funds via
+     * `transfer`. {sendValue} removes this limitation.
+     *
+     * https://consensys.net/diligence/blog/2019/09/stop-using-soliditys-transfer-now/[Learn more].
+     *
+     * IMPORTANT: because control is transferred to `recipient`, care must be
+     * taken to not create reentrancy vulnerabilities. Consider using
+     * {ReentrancyGuard} or the
+     * https://solidity.readthedocs.io/en/v0.8.20/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].
+     */
+    function sendValue(address payable recipient, uint256 amount) internal {
+        if (address(this).balance < amount) {
+            revert Errors.InsufficientBalance(address(this).balance, amount);
+        }
+
+        (bool success, bytes memory returndata) = recipient.call{value: amount}("");
+        if (!success) {
+            _revert(returndata);
+        }
+    }
+
+    /**
+     * @dev Performs a Solidity function call using a low level `call`. A
+     * plain `call` is an unsafe replacement for a function call: use this
+     * function instead.
+     *
+     * If `target` reverts with a revert reason or custom error, it is bubbled
+     * up by this function (like regular Solidity function calls). However, if
+     * the call reverted with no returned reason, this function reverts with a
+     * {Errors.FailedCall} error.
+     *
+     * Returns the raw returned data. To convert to the expected return value,
+     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].
+     *
+     * Requirements:
+     *
+     * - `target` must be a contract.
+     * - calling `target` with `data` must not revert.
+     */
+    function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+        return functionCallWithValue(target, data, 0);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but also transferring `value` wei to `target`.
+     *
+     * Requirements:
+     *
+     * - the calling contract must have an ETH balance of at least `value`.
+     * - the called Solidity function must be `payable`.
+     */
+    function functionCallWithValue(address target, bytes memory data, uint256 value) internal returns (bytes memory) {
+        if (address(this).balance < value) {
+            revert Errors.InsufficientBalance(address(this).balance, value);
+        }
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a static call.
+     */
+    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.staticcall(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],
+     * but performing a delegate call.
+     */
+    function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {
+        (bool success, bytes memory returndata) = target.delegatecall(data);
+        return verifyCallResultFromTarget(target, success, returndata);
+    }
+
+    /**
+     * @dev Tool to verify that a low level call to smart-contract was successful, and reverts if the target
+     * was not a contract or bubbling up the revert reason (falling back to {Errors.FailedCall}) in case
+     * of an unsuccessful call.
+     */
+    function verifyCallResultFromTarget(
+        address target,
+        bool success,
+        bytes memory returndata
+    ) internal view returns (bytes memory) {
+        if (!success) {
+            _revert(returndata);
+        } else {
+            // only check if target is a contract if the call was successful and the return data is empty
+            // otherwise we already know that it was a contract
+            if (returndata.length == 0 && target.code.length == 0) {
+                revert AddressEmptyCode(target);
+            }
+            return returndata;
+        }
+    }
+
+    /**
+     * @dev Tool to verify that a low level call was successful, and reverts if it wasn't, either by bubbling the
+     * revert reason or with a default {Errors.FailedCall} error.
+     */
+    function verifyCallResult(bool success, bytes memory returndata) internal pure returns (bytes memory) {
+        if (!success) {
+            _revert(returndata);
+        } else {
+            return returndata;
+        }
+    }
+
+    /**
+     * @dev Reverts with returndata if present. Otherwise reverts with {Errors.FailedCall}.
+     */
+    function _revert(bytes memory returndata) private pure {
+        // Look for revert reason and bubble it up if present
+        if (returndata.length > 0) {
+            // The easiest way to bubble the revert reason is using memory via assembly
+            assembly ("memory-safe") {
+                revert(add(returndata, 0x20), mload(returndata))
+            }
+        } else {
+            revert Errors.FailedCall();
+        }
+    }
+}
+
+// SPDX-License-Identifier: MIT
+// OpenZeppelin Contracts (last updated v5.1.0) (utils/Errors.sol)
+
+pragma solidity ^0.8.20;
+
+/**
+ * @dev Collection of common custom errors used in multiple contracts
+ *
+ * IMPORTANT: Backwards compatibility is not guaranteed in future versions of the library.
+ * It is recommended to avoid relying on the error API for critical functionality.
+ *
+ * _Available since v5.1._
+ */
+library Errors {
+    /**
+     * @dev The ETH balance of the account is not enough to perform the operation.
+     */
+    error InsufficientBalance(uint256 balance, uint256 needed);
+
+    /**
+     * @dev A call to an address target failed. The target may have reverted.
+     */
+    error FailedCall();
+
+    /**
+     * @dev The deployment failed.
+     */
+    error FailedDeployment();
+
+    /**
+     * @dev A necessary precompile is missing.
+     */
+    error MissingPrecompile(address);
+}
+
+
+
+.deps...remix-tests...remix_accounts.sol
+// SPDX-License-Identifier: GPL-3.0
+
+pragma solidity >=0.4.22 <0.9.0;
+
+library TestsAccounts {
+    function getAccount(uint index) pure public returns (address) {
+        return address(0);
+    }
+}
+
+
+// SPDX-License-Identifier: GPL-3.0
+
+pragma solidity >=0.4.22 <0.9.0;
+
+library Assert {
+
+  event AssertionEvent(
+    bool passed,
+    string message,
+    string methodName
+  );
+
+  event AssertionEventUint(
+    bool passed,
+    string message,
+    string methodName,
+    uint256 returned,
+    uint256 expected
+  );
+
+  event AssertionEventInt(
+    bool passed,
+    string message,
+    string methodName,
+    int256 returned,
+    int256 expected
+  );
+
+  event AssertionEventBool(
+    bool passed,
+    string message,
+    string methodName,
+    bool returned,
+    bool expected
+  );
+
+  event AssertionEventAddress(
+    bool passed,
+    string message,
+    string methodName,
+    address returned,
+    address expected
+  );
+
+  event AssertionEventBytes32(
+    bool passed,
+    string message,
+    string methodName,
+    bytes32 returned,
+    bytes32 expected
+  );
+
+  event AssertionEventString(
+    bool passed,
+    string message,
+    string methodName,
+    string returned,
+    string expected
+  );
+
+  event AssertionEventUintInt(
+    bool passed,
+    string message,
+    string methodName,
+    uint256 returned,
+    int256 expected
+  );
+
+  event AssertionEventIntUint(
+    bool passed,
+    string message,
+    string methodName,
+    int256 returned,
+    uint256 expected
+  );
+
+  function ok(bool a, string memory message) public returns (bool result) {
+    result = a;
+    emit AssertionEvent(result, message, "ok");
+  }
+
+  function equal(uint256 a, uint256 b, string memory message) public returns (bool result) {
+    result = (a == b);
+    emit AssertionEventUint(result, message, "equal", a, b);
+  }
+
+  function equal(int256 a, int256 b, string memory message) public returns (bool result) {
+    result = (a == b);
+    emit AssertionEventInt(result, message, "equal", a, b);
+  }
+
+  function equal(bool a, bool b, string memory message) public returns (bool result) {
+    result = (a == b);
+    emit AssertionEventBool(result, message, "equal", a, b);
+  }
+
+  // TODO: only for certain versions of solc
+  //function equal(fixed a, fixed b, string message) public returns (bool result) {
+  //  result = (a == b);
+  //  emit AssertionEvent(result, message);
+  //}
+
+  // TODO: only for certain versions of solc
+  //function equal(ufixed a, ufixed b, string message) public returns (bool result) {
+  //  result = (a == b);
+  //  emit AssertionEvent(result, message);
+  //}
+
+  function equal(address a, address b, string memory message) public returns (bool result) {
+    result = (a == b);
+    emit AssertionEventAddress(result, message, "equal", a, b);
+  }
+
+  function equal(bytes32 a, bytes32 b, string memory message) public returns (bool result) {
+    result = (a == b);
+    emit AssertionEventBytes32(result, message, "equal", a, b);
+  }
+
+  function equal(string memory a, string memory b, string memory message) public returns (bool result) {
+     result = (keccak256(abi.encodePacked(a)) == keccak256(abi.encodePacked(b)));
+     emit AssertionEventString(result, message, "equal", a, b);
+  }
+
+  function notEqual(uint256 a, uint256 b, string memory message) public returns (bool result) {
+    result = (a != b);
+    emit AssertionEventUint(result, message, "notEqual", a, b);
+  }
+
+  function notEqual(int256 a, int256 b, string memory message) public returns (bool result) {
+    result = (a != b);
+    emit AssertionEventInt(result, message, "notEqual", a, b);
+  }
+
+  function notEqual(bool a, bool b, string memory message) public returns (bool result) {
+    result = (a != b);
+    emit AssertionEventBool(result, message, "notEqual", a, b);
+  }
+
+  // TODO: only for certain versions of solc
+  //function notEqual(fixed a, fixed b, string message) public returns (bool result) {
+  //  result = (a != b);
+  //  emit AssertionEvent(result, message);
+  //}
+
+  // TODO: only for certain versions of solc
+  //function notEqual(ufixed a, ufixed b, string message) public returns (bool result) {
+  //  result = (a != b);
+  //  emit AssertionEvent(result, message);
+  //}
+
+  function notEqual(address a, address b, string memory message) public returns (bool result) {
+    result = (a != b);
+    emit AssertionEventAddress(result, message, "notEqual", a, b);
+  }
+
+  function notEqual(bytes32 a, bytes32 b, string memory message) public returns (bool result) {
+    result = (a != b);
+    emit AssertionEventBytes32(result, message, "notEqual", a, b);
+  }
+
+  function notEqual(string memory a, string memory b, string memory message) public returns (bool result) {
+    result = (keccak256(abi.encodePacked(a)) != keccak256(abi.encodePacked(b)));
+    emit AssertionEventString(result, message, "notEqual", a, b);
+  }
+
+  /*----------------- Greater than --------------------*/
+  function greaterThan(uint256 a, uint256 b, string memory message) public returns (bool result) {
+    result = (a > b);
+    emit AssertionEventUint(result, message, "greaterThan", a, b);
+  }
+
+  function greaterThan(int256 a, int256 b, string memory message) public returns (bool result) {
+    result = (a > b);
+    emit AssertionEventInt(result, message, "greaterThan", a, b);
+  }
+  // TODO: safely compare between uint and int
+  function greaterThan(uint256 a, int256 b, string memory message) public returns (bool result) {
+    if(b < int(0)) {
+      // int is negative uint "a" always greater
+      result = true;
+    } else {
+      result = (a > uint(b));
+    }
+    emit AssertionEventUintInt(result, message, "greaterThan", a, b);
+  }
+  function greaterThan(int256 a, uint256 b, string memory message) public returns (bool result) {
+    if(a < int(0)) {
+      // int is negative uint "b" always greater
+      result = false;
+    } else {
+      result = (uint(a) > b);
+    }
+    emit AssertionEventIntUint(result, message, "greaterThan", a, b);
+  }
+  /*----------------- Lesser than --------------------*/
+  function lesserThan(uint256 a, uint256 b, string memory message) public returns (bool result) {
+    result = (a < b);
+    emit AssertionEventUint(result, message, "lesserThan", a, b);
+  }
+
+  function lesserThan(int256 a, int256 b, string memory message) public returns (bool result) {
+    result = (a < b);
+    emit AssertionEventInt(result, message, "lesserThan", a, b);
+  }
+  // TODO: safely compare between uint and int
+  function lesserThan(uint256 a, int256 b, string memory message) public returns (bool result) {
+    if(b < int(0)) {
+      // int is negative int "b" always lesser
+      result = false;
+    } else {
+      result = (a < uint(b));
+    }
+    emit AssertionEventUintInt(result, message, "lesserThan", a, b);
+  }
+
+  function lesserThan(int256 a, uint256 b, string memory message) public returns (bool result) {
+    if(a < int(0)) {
+      // int is negative int "a" always lesser
+      result = true;
+    } else {
+      result = (uint(a) < b);
+    }
+    emit AssertionEventIntUint(result, message, "lesserThan", a, b);
+  }
+}
